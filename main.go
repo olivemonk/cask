@@ -9,38 +9,61 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const PORT = "6380"
 
+type Entry struct {
+	value string
+	expiresAt time.Time
+	hasExpiry bool
+}
+
 type Store struct {
 	lock sync.Mutex
-	kv   map[string]string
+	kv map[string]Entry
 }
 
 func NewStore() *Store {
 	store := &Store{
-		kv: make(map[string]string),
+		kv: make(map[string]Entry),
 	}
 	return store
 }
 
-func (s *Store) Set(key string, value string) {
+func (s *Store) Set(key string, value string, ttlSeconds int) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	s.kv[key] = value
+
+	entry := Entry{value: value}
+	if ttlSeconds > 0  {
+		entry.hasExpiry = true
+		entry.expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	}
+	s.kv[key] = entry
 }
 
 func (s *Store) Get(key string) (string, bool) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	val, exists := s.kv[key]
-	return val, exists
+
+	entry, found := s.kv[key]
+
+	if !found {
+		return "", false
+	}
+	if entry.hasExpiry && time.Now().After(entry.expiresAt) {
+		delete(s.kv, key)
+		return "", false
+	}
+	return entry.value, true
 }
 
 func (s *Store) Delete(key string) bool {
 	s.lock.Lock()
 	defer s.lock.Unlock()
+
 	if _, exists := s.kv[key]; exists {
 		delete(s.kv, key)
 		return true
@@ -50,33 +73,34 @@ func (s *Store) Delete(key string) bool {
 
 func handleClient(conn net.Conn, store *Store) {
 	defer conn.Close()
+	log.Printf("Client connected: %s", conn.RemoteAddr())
 	reader := bufio.NewReader(conn)
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				fmt.Println("Read error:", err)
+				fmt.Println("Error reading from client:", err)
 			}
-			return
+			break
 		}
 
 		line = strings.TrimSpace(line)
-		if len(line) == 0 || line[0] != '*' {
-			conn.Write([]byte("-ERR expected array format\r\n"))
+		if len(line) == 0 || !strings.HasPrefix(line, "*") {
+			conn.Write([]byte("-ERR expected array input\r\n"))
 			continue
 		}
 
 		count, err := strconv.Atoi(line[1:])
 		if err != nil || count <= 0 {
-			conn.Write([]byte("-ERR bad array count\r\n"))
+			conn.Write([]byte("-ERR invalide argument count\r\n"))
 			continue
 		}
 
-		args := []string{}
+		args := make([]string, 0, count)
 		for i := 0; i < count; i++ {
 			bulkLine, err := reader.ReadString('\n')
-			if err != nil || len(bulkLine) == 0 || bulkLine[0] != '$' {
+			if err != nil || !strings.HasPrefix(bulkLine, "$") {
 				conn.Write([]byte("-ERR expected bulk string\r\n"))
 				return
 			}
@@ -103,42 +127,60 @@ func handleClient(conn net.Conn, store *Store) {
 
 		cmd := strings.ToUpper(args[0])
 
-		if cmd == "PING" {
+		switch cmd {
+		case "PING":
 			if len(args) == 1 {
 				conn.Write([]byte("+PONG\r\n"))
+			} else if len(args) == 2 {
+				resp := fmt.Sprintf("$%d\r\n%s\r\n", len(args[1]), args[1])
+				conn.Write([]byte(resp))
 			} else {
-				conn.Write([]byte("$" + strconv.Itoa(len(args[1])) + "\r\n" + args[1] + "\r\n"))
+				conn.Write([]byte("-ERR wrong number of arguments for PING\r\n"))
 			}
-		} else if cmd == "SET" {
-			if len(args) != 3 {
-				conn.Write([]byte("-ERR SET needs 2 args\r\n"))
+
+		case "SET":
+			if len(args) < 3 || len(args) > 5 {
+				conn.Write([]byte("-ERR SET requires 2 arguments, optionally with EX <seconds>\r\n"))
 				continue
 			}
-			store.Set(args[1], args[2])
+			ttl := 0
+			if len(args) == 5 && strings.ToUpper(args[3]) == "EX" {
+				ttl, err = strconv.Atoi(args[4])
+				if err != nil || ttl < 0 {
+					conn.Write([]byte("-ERR invalid TTL\r\n"))
+					continue
+				}
+			}
+			store.Set(args[1], args[2], ttl)
 			conn.Write([]byte("+OK\r\n"))
-		} else if cmd == "GET" {
+
+		case "GET":
 			if len(args) != 2 {
-				conn.Write([]byte("-ERR GET needs 1 arg\r\n"))
+				conn.Write([]byte("-ERR GET needs 1 argument\r\n"))
 				continue
 			}
-			val, found := store.Get(args[1])
-			if found {
-				conn.Write([]byte("$" + strconv.Itoa(len(val)) + "\r\n" + val + "\r\n"))
+			val, ok := store.Get(args[1])
+			if ok {
+				resp := fmt.Sprintf("$%d\r\n%s\r\n", len(val), val)
+				conn.Write([]byte(resp))
 			} else {
 				conn.Write([]byte("$-1\r\n"))
 			}
-		} else if cmd == "DEL" {
+
+		case "DEL":
 			if len(args) != 2 {
-				conn.Write([]byte("-ERR DEL needs 1 arg\r\n"))
+				conn.Write([]byte("-ERR DEL needs 1 argument\r\n"))
 				continue
 			}
-			if store.Delete(args[1]) {
+			deleted := store.Delete(args[1])
+			if deleted {
 				conn.Write([]byte(":1\r\n"))
 			} else {
 				conn.Write([]byte(":0\r\n"))
 			}
-		} else {
-			conn.Write([]byte("-ERR unknown command\r\n"))
+
+		default:
+			conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", args[0])))
 		}
 	}
 }
